@@ -6,6 +6,7 @@ from typing import TypedDict, Annotated, List
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, BaseMessage, AIMessage
+from langchain_core.tools import BaseTool
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
 
@@ -18,11 +19,11 @@ from agent.threat_intel_graph import run_threat_intel_agent
 from agent.dependency_graph import run_dependency_agent
 from agent.domain_graph import run_domain_agent
 from agent.risk_graph import run_risk_agent
-from agent.session_graph import run_session_analysis_agent
+from agent.session_graph import run_session_agent
 from agent.reporting_graph import run_reporting_agent
 from agent.recon_deterministic_graph import run_recon_deterministic_agent
 from agent.advisory_graph import run_advisory_agent
-from .mcp_client import get_mcp_tools, get_mcp_tool_map
+from .mcp_client import get_mcp_tools, get_mcp_tool_map, get_all_mcp_tools
 
 logger = logging.getLogger("supervisor")
 
@@ -112,16 +113,21 @@ async def _ainvoke_tool(tool_map: dict, name: str, args: dict) -> tuple[dict, di
     return out, {"tool_name": name, "tool_input": args, "tool_output": json.dumps(out)}
 
 
-async def _run_threat_only(message: str) -> dict:
-    return await run_threat_intel_agent(message)
+# Define a fallback direct answer function
+async def _direct_answer():
+    return {"output": "No direct answer available.", "tool_calls": [], "artifact": {}}
 
 
-async def _run_domain_assessment(message: str) -> dict:
-    return await run_domain_agent(message)
+async def _run_threat_only(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
+    return await run_threat_intel_agent(messages, tools)
 
 
-async def _run_dependency_scan(message: str) -> dict:
-    return await run_dependency_agent(message)
+async def _run_domain_assessment(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
+    return await run_domain_agent(messages, tools)
+
+
+async def _run_dependency_scan(messages: List[BaseMessage], tools: List[BaseTool]) -> dict:
+    return await run_dependency_agent(messages, tools)
 
 
 # =========================================================
@@ -141,55 +147,23 @@ async def reasoning_node(state: SupervisorState) -> SupervisorState:
 
 async def execute_node(state: SupervisorState) -> SupervisorState:
     intent = state.get("intent", state.get("selected_agent", "direct_answer"))
-    # Get the last human message
     last_message = state["messages"][-1]
     message = last_message.content if hasattr(last_message, 'content') else str(last_message)
     session_id = state.get("session_id", "")
 
     # Load MCP tools once
     recon_tools, vuln_tools = await get_mcp_tools()
-
-    def _looks_like_vuln_query(msg: str) -> bool:
-        m = (msg or "").lower()
-        return any(k in m for k in ("cve search", "vulnerability", "osv", "pypi", "npm", "maven", "dependency", "@"))
-
-    def _looks_like_recon_query(msg: str) -> bool:
-        m = (msg or "").lower()
-        if extract_domain(msg):
-            return any(
-                k in m
-                for k in (
-                    "public ip",
-                    "ip address",
-                    "what is the ip",
-                    "resolve",
-                    "dns",
-                    "whois",
-                    "scan ports",
-                    "port scan",
-                )
-            )
-        return False
-
-    async def _direct_answer() -> dict:
-        # Preserve existing vuln agent usefulness without mixing intents.
-        if _looks_like_vuln_query(message):
-            return await run_vulnerability_agent(state["messages"], vuln_tools)
-        if _looks_like_recon_query(message):
-            return await run_recon_agent(state["messages"], recon_tools)
-        llm = ChatOpenAI(model=settings.OPENAI_MODEL, api_key=settings.OPENAI_API_KEY, temperature=0)
-        resp = await llm.ainvoke(state["messages"])
-        return {"output": resp.content, "tool_calls": [], "artifact": {"type": "direct_answer"}}
+    all_tools = await get_all_mcp_tools()
 
     handlers = {
-        "risk_assessment": lambda: run_risk_agent(message),
-        "threat_only": lambda: _run_threat_only(message),
-        "advisory_explain": lambda: run_advisory_agent(message),
-        "session_analysis": lambda: run_session_analysis_agent(session_id),
-        "report_generation": lambda: run_reporting_agent(session_id),
-        "domain_assessment": lambda: _run_domain_assessment(message),
-        "dependency_scan": lambda: _run_dependency_scan(message),
-        "recon_only": lambda: run_recon_deterministic_agent(message),
+        "risk_assessment": lambda: run_risk_agent(state["messages"], vuln_tools),
+        "threat_only": lambda: _run_threat_only(state["messages"], vuln_tools),
+        "advisory_explain": lambda: run_advisory_agent(state["messages"], vuln_tools),
+        "session_analysis": lambda: run_session_agent(state["messages"], recon_tools),
+        "report_generation": lambda: run_reporting_agent(state["messages"], recon_tools),
+        "domain_assessment": lambda: _run_domain_assessment(state["messages"], recon_tools),
+        "dependency_scan": lambda: _run_dependency_scan(state["messages"], all_tools),
+        "recon_only": lambda: run_recon_deterministic_agent(state["messages"], recon_tools),
         "direct_answer": _direct_answer,
     }
 
