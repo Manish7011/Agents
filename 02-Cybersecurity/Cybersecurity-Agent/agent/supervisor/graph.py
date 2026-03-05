@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
 
 from shared.config import settings
 from shared.models import RedisSessionStore
@@ -31,7 +30,7 @@ AGENT_TOOL_SCOPE = {
 # =========================================================
 
 class SupervisorState(TypedDict, total=False):
-    messages: Annotated[List[BaseMessage], add_messages]
+    messages: List[BaseMessage]
     selected_agent: str
     output: str
     tool_calls: list
@@ -217,7 +216,7 @@ async def finalize_node(state: SupervisorState) -> SupervisorState:
 
     return {
         "output": output,
-        "messages": [AIMessage(content=output)],
+        "messages": state["messages"] + [AIMessage(content=output)],
     }
 
 
@@ -231,6 +230,7 @@ def build_supervisor_graph(checkpointer=None):
     graph.add_node("reasoning", reasoning_node)
     graph.add_node("agent_executor", agent_executor_node)
     graph.add_node("direct_answer", direct_answer_node)
+    graph.add_node("finalize", finalize_node)
 
     graph.add_edge(START, "reasoning")
 
@@ -241,7 +241,6 @@ def build_supervisor_graph(checkpointer=None):
         else "direct_answer"
     )
 
-    graph.add_node("finalize", finalize_node)
     graph.add_edge("agent_executor", "finalize")
     graph.add_edge("direct_answer", "finalize")
     graph.add_edge("finalize", END)
@@ -282,15 +281,6 @@ async def run_supervisor(user_message: str, session_id: str, graph):
     ]
 
     session_store.save_session_history(session_id, history_data)
-
-    # Save artifacts for the individual turn
-    artifact = final.get("artifact") or {}
-    if artifact:
-        session_store.append_session_artifact(session_id, {
-            "intent": artifact.get("intent") or agent_used,
-            "tool_calls": final.get("tool_calls", []),
-            "timestamp": int(time.time()),
-        })
 
     # Coerce selected_agent to a safe string (empty string if None). This
     # prevents None from being returned to the API which expects a string.
